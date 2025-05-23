@@ -1,0 +1,671 @@
+Codes for Coral regrowth analysis:
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
+from imblearn.over_sampling import ADASYN
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline
+from catboost import CatBoostClassifier
+from sklearn.utils.class_weight import compute_class_weight
+import matplotlib.pyplot as plt
+
+# Load the dataset from the CSV file
+file_path = 'G:/Coral/output_with_resilience_1.csv'  # Replace with your actual CSV file path
+df = pd.read_csv(file_path, low_memory=False)
+
+# Check the structure of the dataset
+print("Dataset preview:")
+print(df.head())
+
+# Handle missing or invalid temperature columns (convert to numeric and drop NaNs)
+temperature_columns = ['Temperature_Mean_regrowth', 'Temperature_Minimum_regrowth',
+'ClimSST_regrowth', 'ClimSST_bleaching', 'Temperature_Kelvin_bleaching']
+
+df[temperature_columns] = df[temperature_columns].apply(pd.to_numeric, errors='coerce')
+df.dropna(subset=temperature_columns, inplace=True)
+
+X = df[temperature_columns]
+
+# Resilience Status as target variable (Resilient = 1, Non-Resilient = 0, Moderate = 2)
+df['Resilience_Status'] = pd.cut(df['Regrowth_Rate'], bins=[-float('inf'), 0, float('inf')],
+labels=["Non-Resilient", "Resilient"])
+df['Resilience_Status_Numeric'] = df['Resilience_Status'].cat.codes
+
+# Ensure the target labels are starting from 0 and are consecutive integers
+# If there is a -1, remap it to 2 (for Moderate)
+df['Resilience_Status_Numeric'] = df['Resilience_Status_Numeric'].replace({-1: 2})
+
+# Check the unique values in Resilience_Status_Numeric
+print("\nUnique values in Resilience_Status_Numeric:")
+print(df['Resilience_Status_Numeric'].unique())
+
+# The target variable is Resilience_Status_Numeric
+y = df['Resilience_Status_Numeric']
+
+# Apply Max-Min Normalization using MinMaxScaler
+scaler = MinMaxScaler()  # MinMaxScaler scales data to [0, 1]
+X_scaled = scaler.fit_transform(X)
+
+# Split the data into training and testing sets (80% training, 20% testing)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+
+# Handle class imbalance using ADASYN and RandomUnderSampler
+oversampler = ADASYN(random_state=42, sampling_strategy='minority')
+undersampler = RandomUnderSampler(random_state=42, sampling_strategy='majority')
+pipeline = Pipeline([('oversample', oversampler), ('undersample', undersampler)])
+X_train_resampled, y_train_resampled = pipeline.fit_resample(X_train, y_train)
+
+# Check the class distribution after resampling
+print("\nClass distribution after resampling:")
+print(pd.Series(y_train_resampled).value_counts())
+
+# Compute class weights based on the resampled data
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train_resampled), y=y_train_resampled)
+class_weights_dict = dict(zip(np.unique(y_train_resampled), class_weights))
+
+print(f"\nClass weights: {class_weights_dict}")
+
+# Train a CatBoost model with tuned hyperparameters
+catboost_model = CatBoostClassifier(
+iterations=200,  # Number of boosting iterations
+depth=6,  # Depth of the trees
+learning_rate=0.05,  # Learning rate
+loss_function='MultiClass',  # Loss function for multi-class classification
+class_weights=class_weights_dict,  # Class weights for imbalanced data
+random_state=42,
+verbose=100  # Print progress every 100 iterations
+)
+
+# Train the CatBoost model
+catboost_model.fit(X_train_resampled, y_train_resampled)
+
+# Evaluate the CatBoost model
+y_pred_catboost = catboost_model.predict(X_test)
+y_pred_proba_catboost = catboost_model.predict_proba(X_test)
+
+print("\nCatBoost Results:")
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_catboost))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_catboost, target_names=["Non-Resilient", "Resilient", "Moderate"]))
+
+# ROC AUC Score for multi-class classification
+# 'ovr' stands for one-vs-rest (i.e., each class against all others)
+roc_auc = roc_auc_score(y_test, y_pred_proba_catboost,
+multi_class='ovr')  # Use 'ovr' (one-vs-rest) for multi-class ROC AUC
+print(f"\nOverall ROC AUC Score: {roc_auc}")
+
+# Plot ROC curves for each class
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+for i in range(len(np.unique(y))):
+# Create binary labels for the current class
+y_test_binary = (y_test == i).astype(int)
+y_pred_proba_binary = y_pred_proba_catboost[:, i]
+
+# Calculate ROC curve and ROC AUC for the current class
+fpr[i], tpr[i], _ = roc_curve(y_test_binary, y_pred_proba_binary)
+roc_auc[i] = roc_auc_score(y_test_binary, y_pred_proba_binary)  # No multi_class parameter here
+
+plt.figure()
+colors = ['blue', 'red', 'green']
+for i, color in zip(range(len(np.unique(y))), colors):
+plt.plot(fpr[i], tpr[i], color=color, lw=2,
+label='ROC curve of class {0} (area = {1:0.2f})'
+''.format(i, roc_auc[i]))
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve for Each Class')
+plt.legend(loc="lower right")
+plt.show()
+
+# Feature Importance
+feature_importance = catboost_model.get_feature_importance()
+feature_names = temperature_columns
+for feature_name, importance in zip(feature_names, feature_importance):
+print(f"{feature_name}: {importance}")
+
+# Plot Feature Importance
+plt.figure(figsize=(10, 6))
+plt.barh(feature_names, feature_importance)
+plt.xlabel('Feature Importance')
+plt.title('Feature Importance from CatBoost Model')
+plt.show() 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Code for mapping:
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+# Load the dataset
+file_path = 'G:/Coral/output_with_resilience_33.59.csv'  # Update the path
+df = pd.read_csv(file_path)
+
+# Ensure required columns exist
+required_columns = {'Latitude_Degrees_regrowth', 'Longitude_Degrees_regrowth', 'Resilience_Status'}
+if not required_columns.issubset(df.columns):
+    raise ValueError("Dataset must contain 'Latitude_Degrees_regrowth', 'Longitude_Degrees_regrowth', and 'Resilience_Status'.")
+
+# Download the world map if not available
+world_map_url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+world = gpd.read_file(world_map_url)
+
+# Define colors for resilience status
+resilience_colors = {
+    "Resilient": "green",
+    "Moderate": "orange",
+    "Non-Resilient": "red"
+}
+
+# Convert regrowth locations into a GeoDataFrame
+gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df['Longitude_Degrees_regrowth'], df['Latitude_Degrees_regrowth']))
+
+# Plot the map
+fig, ax = plt.subplots(figsize=(12, 8))
+world.plot(ax=ax, color="lightgray", edgecolor="black")  # Plot base map
+
+# Plot resilience status points
+for status, color in resilience_colors.items():
+    subset = gdf[gdf['Resilience_Status'] == status]
+    subset.plot(ax=ax, markersize=50, color=color, label=status, alpha=0.7)
+
+# Add map title, labels, and legend
+plt.title("Coral Reef Resilience Status Map (Regrowth Sites)", fontsize=14)
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.legend(title="Resilience Status", loc="upper right")
+
+# Save the figure
+output_map_path = 'G:/Coral/resilience_map.png'
+plt.savefig(output_map_path, dpi=300)
+plt.show()
+
+print(f"Map saved as: {output_map_path}")
+
+Code for threshold calculation:
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+from ruptures import Pelt
+
+# Load dataset
+file_path = "G:/Coral/regrowth_dataset.csv"  # Update with actual file path
+df = pd.read_csv(file_path, low_memory=False)
+
+# Convert columns to numeric (handle errors)
+df['Date_Year_regrowth'] = pd.to_numeric(df['Date_Year_regrowth'], errors='coerce')
+df['Date_Year_bleaching'] = pd.to_numeric(df['Date_Year_bleaching'], errors='coerce')
+df['Percent_Bleaching'] = pd.to_numeric(df['Percent_Bleaching'], errors='coerce')
+df['Percent_Hard_Coral_Cover'] = pd.to_numeric(df['Percent_Hard_Coral_Cover'], errors='coerce')
+
+# Drop any rows where bleaching or coral cover is missing
+df.dropna(subset=['Percent_Bleaching', 'Percent_Hard_Coral_Cover'], inplace=True)
+
+# Ensure the dataset is not empty after cleaning
+if df.empty:
+    print("Dataset is empty after cleaning! Check your data.")
+    exit()
+
+# Group by bleaching year and calculate mean values
+df_grouped = df.groupby('Date_Year_bleaching').agg({
+    'Percent_Bleaching': 'mean',
+    'Percent_Hard_Coral_Cover': 'mean'
+}).reset_index()
+
+# Ensure we have at least 3 data points for change-point detection
+if len(df_grouped) < 3:
+    print("Not enough data points for change-point detection.")
+    exit()
+
+# Correlation between bleaching and coral cover
+correlation = df_grouped[['Percent_Bleaching', 'Percent_Hard_Coral_Cover']].corr().iloc[0, 1]
+print(f"Correlation between bleaching and coral cover: {correlation:.2f}")
+
+# Linear regression: Effect of bleaching on coral cover
+slope, intercept, r_value, p_value, std_err = linregress(df_grouped['Percent_Bleaching'],
+                                                         df_grouped['Percent_Hard_Coral_Cover'])
+print(f"Regression Slope: {slope:.2f}, Intercept: {intercept:.2f}, RÂ²: {r_value ** 2:.2f}")
+
+# Change-point detection for bleaching threshold
+bleaching_series = df_grouped['Percent_Bleaching'].dropna().values.reshape(-1, 1)
+
+# Apply change-point detection only if we have enough valid values
+if len(bleaching_series) >= 3:
+    algo = Pelt(model="rbf").fit(bleaching_series)
+    change_points = algo.predict(pen=10)
+
+    # Ensure detected change points are within valid index range
+    valid_change_points = [cp for cp in change_points if cp < len(df_grouped)]
+
+    if valid_change_points:
+        bleaching_threshold = df_grouped.iloc[valid_change_points[0]]['Percent_Bleaching']
+        print(f"Estimated Bleaching Threshold: {bleaching_threshold:.2f}%")
+    else:
+        # Use 75th percentile if no valid change point found
+        bleaching_threshold = np.percentile(df_grouped['Percent_Bleaching'], 75)
+        print(f"No valid change-point detected. Using fallback threshold (75th Percentile): {bleaching_threshold:.2f}%")
+else:
+    print("Not enough data points for change-point detection.")
+    exit()
+
+# Plot the bleaching vs coral cover relationship
+plt.figure(figsize=(10, 6))
+plt.scatter(df_grouped['Percent_Bleaching'], df_grouped['Percent_Hard_Coral_Cover'], label="Data", alpha=0.7)
+plt.plot(df_grouped['Percent_Bleaching'], intercept + slope * df_grouped['Percent_Bleaching'], color='red',
+         label="Regression Line")
+
+# Mark the threshold
+plt.axvline(bleaching_threshold, color='blue', linestyle='--', label=f"Threshold: {bleaching_threshold:.2f}%")
+
+plt.xlabel("Percent Bleaching")
+plt.ylabel("Percent Hard Coral Cover")
+plt.title("Bleaching vs Coral Cover (Threshold Analysis)")
+plt.legend()
+plt.grid(False)
+
+# Save the figure as TIFF with 300 DPI
+plt.savefig("G:/Coral/bleaching_vs_coral_cover.tiff", dpi=300, format='tiff', bbox_inches='tight')
+
+# Show the plot
+plt.show()
+
+
+
+Code for resilience:
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Load the dataset from the CSV file
+file_path = 'G:/Coral/Resilience_dataset.csv'  # Update with actual path
+df = pd.read_csv(file_path, low_memory=False)  # Suppress mixed data types warning
+
+# Check the structure of the dataset to ensure it loaded correctly
+print("Dataset preview:")
+print(df.head())
+
+# Convert Date_Year_regrowth and Date_Year_bleaching to numeric, handling errors
+df['Date_Year_regrowth'] = pd.to_numeric(df['Date_Year_regrowth'], errors='coerce')
+df['Date_Year_bleaching'] = pd.to_numeric(df['Date_Year_bleaching'], errors='coerce')
+
+# Drop rows with missing regrowth or bleaching years
+df.dropna(subset=['Date_Year_regrowth', 'Date_Year_bleaching'], inplace=True)
+
+# Ensure Date_Year columns are integers
+df['Date_Year_regrowth'] = df['Date_Year_regrowth'].astype(int)
+df['Date_Year_bleaching'] = df['Date_Year_bleaching'].astype(int)
+
+# Check number of rows in the dataset
+print(f"Number of rows in dataset: {len(df)}")
+
+# Calculate the Regrowth Rate: percent change in Percent_Hard_Coral_Cover_regrowth
+df['Regrowth_Rate'] = df['Percent_Hard_Coral_Cover_regrowth'].pct_change() * 100
+
+# Plot Coral Cover vs Bleaching as Line Plot
+plt.figure(figsize=(10, 6))
+
+# Plot Percent Hard Coral Cover
+plt.plot(df['Date_Year_regrowth'], df['Percent_Hard_Coral_Cover_regrowth'], label="Hard Coral Cover (%)", marker='o')
+
+# Plot Percent Bleaching
+plt.plot(df['Date_Year_bleaching'], df['Percent_Bleaching'], label="Percent Bleaching (%)", marker='x')
+
+# Add titles and labels
+plt.title("Coral Cover and Bleaching Over Time")
+plt.xlabel("Year")
+plt.ylabel("Percentage (%)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Define the new bleaching threshold
+bleaching_threshold = 33.59
+
+# Classify resilience based on regrowth rate and bleaching threshold
+df['Resilience_Status'] = pd.cut(
+    df['Regrowth_Rate'],
+    bins=[-float('inf'), 0, float('inf')],
+    labels=["Non-Resilient", "Resilient"]
+)
+
+# Convert to categorical type
+df['Resilience_Status'] = pd.Categorical(df['Resilience_Status'], categories=["Non-Resilient", "Resilient", "Moderate"])
+
+# Apply the new bleaching threshold
+df.loc[df['Percent_Bleaching'] > bleaching_threshold, 'Resilience_Status'] = "Non-Resilient"
+df.loc[(df['Percent_Bleaching'] <= bleaching_threshold) & (df['Resilience_Status'] == "Resilient"), 'Resilience_Status'] = "Resilient"
+df.loc[(df['Percent_Bleaching'] <= bleaching_threshold) & (df['Resilience_Status'] == "Non-Resilient"), 'Resilience_Status'] = "Moderate"
+
+# Display DataFrame with Resilience Status
+print("\nResilience Status of Reef over time:")
+print(df[['Date_Year_regrowth', 'Resilience_Status']])
+
+# Save the output with resilience analysis to a new CSV file
+df.to_csv('G:/Coral/output_with_resilience_33.59.csv', index=False)
+
+Code for parameter importance plot:
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, roc_curve
+from imblearn.over_sampling import ADASYN
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline
+from catboost import CatBoostClassifier
+from sklearn.utils.class_weight import compute_class_weight
+import matplotlib.pyplot as plt
+
+# Load the dataset from the CSV file
+file_path = 'E:/SHLD/Coral data/Coral_prediction_analysis/output_with_resilience_1.csv'  # Replace with your actual CSV file path
+df = pd.read_csv(file_path, low_memory=False)
+
+# Check the structure of the dataset
+print("Dataset preview:")
+print(df.head())
+
+# Handle missing or invalid temperature columns (convert to numeric and drop NaNs)
+temperature_columns = [
+    'Temperature_Mean_regrowth', 'Temperature_Minimum_regrowth',
+    'ClimSST_regrowth', 'ClimSST_bleaching', 'Temperature_Kelvin_bleaching',
+    'SSTA_DHW_regrowth', 'SSTA_DHW_bleaching'  # Add new features
+]
+
+df[temperature_columns] = df[temperature_columns].apply(pd.to_numeric, errors='coerce')
+df.dropna(subset=temperature_columns, inplace=True)
+
+X = df[temperature_columns]
+
+# Resilience Status as target variable (Resilient = 1, Non-Resilient = 0, Moderate = 2)
+df['Resilience_Status'] = pd.cut(df['Regrowth_Rate'], bins=[-float('inf'), 0, float('inf')],
+                                 labels=["Non-Resilient", "Resilient"])
+df['Resilience_Status_Numeric'] = df['Resilience_Status'].cat.codes
+
+# Ensure the target labels are starting from 0 and are consecutive integers
+# If there is a -1, remap it to 2 (for Moderate)
+df['Resilience_Status_Numeric'] = df['Resilience_Status_Numeric'].replace({-1: 2})
+
+# Check the unique values in Resilience_Status_Numeric
+print("\nUnique values in Resilience_Status_Numeric:")
+print(df['Resilience_Status_Numeric'].unique())
+
+# The target variable is Resilience_Status_Numeric
+y = df['Resilience_Status_Numeric']
+
+# Apply Max-Min Normalization using MinMaxScaler
+scaler = MinMaxScaler()  # MinMaxScaler scales data to [0, 1]
+X_scaled = scaler.fit_transform(X)
+
+# Split the data into training and testing sets (80% training, 20% testing)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42, stratify=y)
+
+# Handle class imbalance using ADASYN and RandomUnderSampler
+oversampler = ADASYN(random_state=42, sampling_strategy='minority')
+undersampler = RandomUnderSampler(random_state=42, sampling_strategy='majority')
+pipeline = Pipeline([('oversample', oversampler), ('undersample', undersampler)])
+X_train_resampled, y_train_resampled = pipeline.fit_resample(X_train, y_train)
+
+# Check the class distribution after resampling
+print("\nClass distribution after resampling:")
+print(pd.Series(y_train_resampled).value_counts())
+
+# Compute class weights based on the resampled data
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train_resampled), y=y_train_resampled)
+class_weights_dict = dict(zip(np.unique(y_train_resampled), class_weights))
+
+print(f"\nClass weights: {class_weights_dict}")
+
+# Train a CatBoost model with tuned hyperparameters
+catboost_model = CatBoostClassifier(
+    iterations=200,  # Number of boosting iterations
+    depth=6,  # Depth of the trees
+    learning_rate=0.05,  # Learning rate
+    loss_function='MultiClass',  # Loss function for multi-class classification
+    class_weights=class_weights_dict,  # Class weights for imbalanced data
+    random_state=42,
+    verbose=100  # Print progress every 100 iterations
+)
+
+# Train the CatBoost model
+catboost_model.fit(X_train_resampled, y_train_resampled)
+
+# Evaluate the CatBoost model
+y_pred_catboost = catboost_model.predict(X_test)
+y_pred_proba_catboost = catboost_model.predict_proba(X_test)
+
+print("\nCatBoost Results:")
+print("Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred_catboost))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_catboost, target_names=["Non-Resilient", "Resilient", "Moderate"]))
+
+# ROC AUC Score for multi-class classification
+# 'ovr' stands for one-vs-rest (i.e., each class against all others)
+roc_auc = roc_auc_score(y_test, y_pred_proba_catboost,
+                        multi_class='ovr')  # Use 'ovr' (one-vs-rest) for multi-class ROC AUC
+print(f"\nOverall ROC AUC Score: {roc_auc}")
+
+# Plot ROC curves for each class
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+for i in range(len(np.unique(y))):
+    # Create binary labels for the current class
+    y_test_binary = (y_test == i).astype(int)
+    y_pred_proba_binary = y_pred_proba_catboost[:, i]
+
+    # Calculate ROC curve and ROC AUC for the current class
+    fpr[i], tpr[i], _ = roc_curve(y_test_binary, y_pred_proba_binary)
+    roc_auc[i] = roc_auc_score(y_test_binary, y_pred_proba_binary)  # No multi_class parameter here
+
+plt.figure()
+colors = ['blue', 'red', 'green']
+for i, color in zip(range(len(np.unique(y))), colors):
+    plt.plot(fpr[i], tpr[i], color=color, lw=2,
+             label='ROC curve of class {0} (area = {1:0.2f})'
+                   ''.format(i, roc_auc[i]))
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve for Each Class')
+plt.legend(loc="lower right")
+plt.show()
+
+# Feature Importance
+feature_importance = catboost_model.get_feature_importance()
+feature_names = temperature_columns
+for feature_name, importance in zip(feature_names, feature_importance):
+    print(f"{feature_name}: {importance}")
+
+# Feature Importance
+feature_importance = catboost_model.get_feature_importance()
+
+# Abbreviate feature names for better visualization
+abbreviated_feature_names = [
+    "DHW_B",       # SSTA_DHW_bleaching
+    "DHW_R",       # SSTA_DHW_regrowth
+    "Temp_K",      # Temperature_Kelvin_bleaching
+    "ClimSST_B",   # ClimSST_bleaching
+    "ClimSST_R",   # ClimSST_regrowth
+    "Temp_Min",    # Temperature_Minimum_regrowth
+    "Temp_Mean"    # Temperature_Mean_regrowth
+]
+
+# Plot Feature Importance
+plt.figure(figsize=(10, 6))  # Adjust figure size
+plt.barh(abbreviated_feature_names, feature_importance, color='skyblue')  # Use a different color
+plt.xlabel('Feature Importance', fontsize=12)  # Increase font size for x-axis label
+plt.ylabel('Features', fontsize=12)  # Increase font size for y-axis label
+plt.title('Feature Importance from CatBoost Model', fontsize=14, pad=20)  # Add padding to the title
+plt.xticks(fontsize=10)  # Increase font size for x-axis ticks
+plt.yticks(fontsize=10)  # Increase font size for y-axis ticks
+plt.grid(axis='x', linestyle='--', alpha=0.7)  # Add gridlines for better readability
+
+# Save feature importance plot as TIFF with 300 DPI
+plt.savefig("E:/SHLD/Coral data/feature_importance_abbreviated.tiff", format="tiff", dpi=300, bbox_inches='tight')  # Ensure tight layout
+plt.show()
+
+import shap
+explainer = shap.TreeExplainer(catboost_model)
+shap_values = explainer.shap_values(X_train_resampled)
+shap.summary_plot(shap_values, X_train_resampled, feature_names=temperature_columns)
+
+Code for threshold calculation using fallback method:
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import linregress
+from ruptures import Pelt
+
+# Load dataset
+file_path = "G:/Coral/regrowth_dataset.csv"  # Update with actual file path
+df = pd.read_csv(file_path, low_memory=False)
+
+# Convert columns to numeric (handle errors)
+df['Date_Year_regrowth'] = pd.to_numeric(df['Date_Year_regrowth'], errors='coerce')
+df['Date_Year_bleaching'] = pd.to_numeric(df['Date_Year_bleaching'], errors='coerce')
+df['Percent_Bleaching'] = pd.to_numeric(df['Percent_Bleaching'], errors='coerce')
+df['Percent_Hard_Coral_Cover'] = pd.to_numeric(df['Percent_Hard_Coral_Cover'], errors='coerce')
+
+# Drop any rows where bleaching or coral cover is missing
+df.dropna(subset=['Percent_Bleaching', 'Percent_Hard_Coral_Cover'], inplace=True)
+
+# Ensure the dataset is not empty after cleaning
+if df.empty:
+    print("Dataset is empty after cleaning! Check your data.")
+    exit()
+
+# Group by bleaching year and calculate mean values
+df_grouped = df.groupby('Date_Year_bleaching').agg({
+    'Percent_Bleaching': 'mean',
+    'Percent_Hard_Coral_Cover': 'mean'
+}).reset_index()
+
+# Ensure we have at least 3 data points for change-point detection
+if len(df_grouped) < 3:
+    print("Not enough data points for change-point detection.")
+    exit()
+
+# Correlation between bleaching and coral cover
+correlation = df_grouped[['Percent_Bleaching', 'Percent_Hard_Coral_Cover']].corr().iloc[0, 1]
+print(f"Correlation between bleaching and coral cover: {correlation:.2f}")
+
+# Linear regression: Effect of bleaching on coral cover
+slope, intercept, r_value, p_value, std_err = linregress(df_grouped['Percent_Bleaching'],
+                                                         df_grouped['Percent_Hard_Coral_Cover'])
+print(f"Regression Slope: {slope:.2f}, Intercept: {intercept:.2f}, R²: {r_value ** 2:.2f}")
+
+# Change-point detection for bleaching threshold
+bleaching_series = df_grouped['Percent_Bleaching'].dropna().values.reshape(-1, 1)
+
+# Apply change-point detection only if we have enough valid values
+if len(bleaching_series) >= 3:
+    algo = Pelt(model="rbf").fit(bleaching_series)
+    change_points = algo.predict(pen=10)
+
+    # Ensure detected change points are within valid index range
+    valid_change_points = [cp for cp in change_points if cp < len(df_grouped)]
+
+    if valid_change_points:
+        bleaching_threshold = df_grouped.iloc[valid_change_points[0]]['Percent_Bleaching']
+        print(f"Estimated Bleaching Threshold: {bleaching_threshold:.2f}%")
+    else:
+        # Use 75th percentile if no valid change point found
+        bleaching_threshold = np.percentile(df_grouped['Percent_Bleaching'], 75)
+        print(f"No valid change-point detected. Using fallback threshold (75th Percentile): {bleaching_threshold:.2f}%")
+else:
+    print("Not enough data points for change-point detection.")
+    exit()
+
+# Plot the bleaching vs coral cover relationship
+plt.figure(figsize=(10, 6))
+plt.scatter(df_grouped['Percent_Bleaching'], df_grouped['Percent_Hard_Coral_Cover'], label="Data", alpha=0.7)
+plt.plot(df_grouped['Percent_Bleaching'], intercept + slope * df_grouped['Percent_Bleaching'], color='red',
+         label="Regression Line")
+
+# Mark the threshold
+plt.axvline(bleaching_threshold, color='blue', linestyle='--', label=f"Threshold: {bleaching_threshold:.2f}%")
+
+plt.xlabel("Percent Bleaching")
+plt.ylabel("Percent Hard Coral Cover")
+plt.title("Bleaching vs Coral Cover (Threshold Analysis)")
+plt.legend()
+plt.grid(True)
+plt.show()
